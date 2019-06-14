@@ -15,6 +15,9 @@
     </modules>
 
     <properties>
+	    <maven.compiler.source>9</maven.compiler.source>
+	    <maven.compiler.target>9</maven.compiler.target>
+	    
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.version>4.12</junit.version>
 
