@@ -19,8 +19,7 @@ class ClusterExecutor(private val channel: JChannel) {
     data class Task(val id: TaskId, val callableData: ByteArray, val dependencies: Collection<String>): Serializable
 
     // locally accepted tasks
-    private val submittedTasks = ConcurrentHashMap<Task, CompletableFuture<Any>>()
-    private val assignedTasks = ConcurrentHashMap<TaskId, Address>()
+    private val assignedTasks = ConcurrentHashMap<Pair<TaskId, Address>, CompletableFuture<Any>>()
 
     // cluster status
     private val currentMembersWorkload = ConcurrentHashMap<Address, Long>()
@@ -163,22 +162,12 @@ class ClusterExecutor(private val channel: JChannel) {
                         currentMembersWorkload[msg.src]=msgObject.size
                     }
                     is TaskResultExceptionMessage -> {
-                        if (assignedTasks[msgObject.id] == msg.src ) {
-                            log.debug("Received throwable for task ${msgObject.id} from ${msg.src}: ${msgObject.throwable.message}")
-                            assignedTasks.remove(msgObject.id)
-                            submittedTasks.keys.first { it.id == msgObject.id }?.let {
-                                submittedTasks.remove(it)?.completeExceptionally(msgObject.throwable)
-                            }
-                        }
+                        log.debug("Received throwable for task ${msgObject.id} from ${msg.src}: ${msgObject.throwable.message}")
+                        assignedTasks[Pair(msgObject.id, msg.src)]?.completeExceptionally(msgObject.throwable)
                     }
                     is TaskResultMessage -> {
-                        if (assignedTasks[msgObject.id] == msg.src ) {
-                            log.debug("Received result for task ${msgObject.id} from ${msg.src}")
-                            assignedTasks.remove(msgObject.id)
-                            submittedTasks.keys.first { it.id == msgObject.id }?.let {
-                                submittedTasks.remove(it)?.complete(msgObject.result)
-                            }
-                        }
+                        log.debug("Received result for task ${msgObject.id} from ${msg.src}")
+                        assignedTasks[Pair(msgObject.id, msg.src)]?.complete(msgObject.result)
                     }
                     is ClassDefinitionMessageData -> {
                         log.debug("Received class data ${msgObject.canonicalName} from ${msg.src}")
@@ -216,28 +205,31 @@ class ClusterExecutor(private val channel: JChannel) {
 
     private fun getLocalQueueSize() = localExecutor.taskCount - localExecutor.completedTaskCount
 
-    private fun submitTaskToMember(task: Task, member: Address = currentMembersWorkload.minBy { (_,v) -> v }!!.key) {
-        assignedTasks[task.id] = member
+    private fun submitTaskToMember(task: Task, member: Address = currentMembersWorkload.minBy { (_,v) -> v }!!.key): CompletableFuture<Any> {
+        val memberKey = Pair(task.id,member)
+
+        val taskFuture = CompletableFuture<Any>()
+
+        assignedTasks[memberKey] = taskFuture
         log.debug("Sending task ${task.id} to $member")
         channel.send(member, ScheduleTaskMessage(task))
         //speculative increase of a remote work queue
-        currentMembersWorkload[member]=(currentMembersWorkload[member]?:0) + 1
+        currentMembersWorkload[member] = (currentMembersWorkload[member]?:0) + 1
         // TODO: add timeout
+
+        return taskFuture.whenComplete { t, u ->
+            assignedTasks.remove(memberKey)
+        }
     }
 
     fun <T> submit(callable: Callable<T>, dependencies: Collection<String> = setOf()) : CompletableFuture<T> {
-        if (callable !is Serializable) {
-            throw IllegalArgumentException("Command $callable has to be serializable")
-        }
+        require(callable is Serializable) { "Command $callable has to be serializable" }
+
         val callableObjectData = Util.objectToByteBuffer(callable)
         val task = Task(TaskId(), callableObjectData, dependencies)
-        val taskFuture = CompletableFuture<T>()
 
         log.debug("Accepting task ${task.id}")
-        submittedTasks[task as Task]=taskFuture as CompletableFuture<Any>
-        submitTaskToMember(task)
-
-        return taskFuture
+        return submitTaskToMember(task) as CompletableFuture<T>
     }
 
 }
@@ -245,8 +237,9 @@ class ClusterExecutor(private val channel: JChannel) {
 fun main() {
     // to connect you can provide jgroups variables, e.g.:
     // -Djgroups.bind_addr=192.168.5.2
+//    System.setProperty("jgroups.bind_addr", "192.168.56.1")
 
-    val channel = JChannel()
+    val channel = JChannel(System.getProperty("jgroups.property","udp.xml"))
     channel.connect("classloader.proxy")
     ClusterExecutor(channel)
 
