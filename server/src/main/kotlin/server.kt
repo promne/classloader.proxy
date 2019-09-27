@@ -103,7 +103,8 @@ class ClusterExecutor(private val channel: JChannel) {
             this.javaClass.classLoader
         } else {
             log.debug("Resolving dependencies for task ${task.id}: ${task.dependencies}")
-            val libs = Maven.resolver().resolve(task.dependencies).withTransitivity().asFile()
+            val resolver = System.getProperty("m2settings")?.let { Maven.configureResolver().fromFile(it)  } ?: Maven.resolver()
+            val libs = resolver.resolve(task.dependencies).withTransitivity().asFile()
             log.debug("Resolved dependencies for task ${task.id}")
 
             val libURLs = libs.map { it.toURI().toURL() }.toTypedArray()
@@ -119,8 +120,11 @@ class ClusterExecutor(private val channel: JChannel) {
 
             override fun viewAccepted(view: View) {
                 val missing = currentMembersWorkload.keys.filterNot(view::containsMember)
-                missing.forEach { currentMembersWorkload.remove(it) }
+                missing.forEach {memberAddress ->
+                    currentMembersWorkload.remove(memberAddress)
+                    assignedTasks.filter { memberAddress.equals(it.key.second) }.values.forEach { it.completeExceptionally(IllegalStateException("Member $memberAddress lost")) }
                 //TODO: reassign work of missing
+                }
             }
 
             override fun receive(msg: Message) {
@@ -153,7 +157,6 @@ class ClusterExecutor(private val channel: JChannel) {
                                     channel.send(msg.src, resultMsg)
                                     broadcastLoad()
                                 }
-                        broadcastLoad()
                     }
                     is ScheduledQueueSize -> {
                         if (!currentMembersWorkload.containsKey(msg.src)) {
@@ -190,12 +193,14 @@ class ClusterExecutor(private val channel: JChannel) {
             while (true) {
                 Thread.sleep(5000)
                 broadcastLoad()
+                log.debug { "Cluster queue status: $currentMembersWorkload" }
             }
         }
     }
 
     private fun broadcastLoad() {
-        channel.send(null, ScheduledQueueSize(getLocalQueueSize()))
+        val queueSize = getLocalQueueSize()
+        channel.send(null, ScheduledQueueSize(queueSize))
     }
 
     fun clusterLoad() : Double {
