@@ -10,29 +10,35 @@ import java.util.concurrent.*
 import java.util.function.Function
 import java.util.function.Supplier
 
-class ClusterExecutor(private val channel: JChannel) {
+class ClusterExecutor(private val channel: JChannel, private val maxTaskCount: Int, private val broadcastInterval : Long = 5000) {
 
     private val log = KotlinLogging.logger {}
 
     // data classes
     data class TaskId(val x: String = UUID.randomUUID().toString()): Serializable
-    data class Task(val id: TaskId, val callableData: ByteArray, val dependencies: Collection<String>): Serializable
+    data class Task(val id: TaskId, val callableData: ByteArray, val dependencies: Collection<String>, val timeout: Long, val timeUnit: TimeUnit): Serializable
+    data class TaskStats(val time: Long): Serializable
 
     // locally accepted tasks
+    private val submittedTasks = ConcurrentLinkedQueue<Pair<Task, CompletableFuture<Any>>>()
     private val assignedTasks = ConcurrentHashMap<Pair<TaskId, Address>, CompletableFuture<Any>>()
+    private val executingTasks = ConcurrentHashMap.newKeySet<TaskId>()
 
     // cluster status
-    private val currentMembersWorkload = ConcurrentHashMap<Address, Long>()
+    private val currentMembersQueueStats = ConcurrentHashMap<Address, TaskQueueStats>()
     get() {
-        field.computeIfAbsent(channel.address) { getLocalQueueSize() }
+        field.computeIfAbsent(channel.address) { getLocalQueueStats() }
         return field
     }
 
     // messages
+    class TaskRequestMessage(): Serializable
     data class ScheduleTaskMessage(val task: Task): Serializable
-    data class TaskResultMessage(val id: TaskId, val result: Any): Serializable
+    data class TaskResultMessage(val id: TaskId, val stats: TaskStats, val result: Any): Serializable
     data class TaskResultExceptionMessage(val id: TaskId, val throwable: Throwable): Serializable
-    data class ScheduledQueueSize(val size: Long): Serializable
+    data class TaskQueueStats(val executing: Int, val submitted: Int, val assigned: Int): Serializable {
+        override fun toString(): String = "[$executing, $submitted, $assigned]"
+    }
 
     // locally executed tasks
     private val localExecutor = Executors.newCachedThreadPool() as ThreadPoolExecutor
@@ -119,9 +125,9 @@ class ClusterExecutor(private val channel: JChannel) {
         channel.receiver = object : ReceiverAdapter() {
 
             override fun viewAccepted(view: View) {
-                val missing = currentMembersWorkload.keys.filterNot(view::containsMember)
+                val missing = currentMembersQueueStats.keys.filterNot(view::containsMember)
                 missing.forEach {memberAddress ->
-                    currentMembersWorkload.remove(memberAddress)
+                    currentMembersQueueStats.remove(memberAddress)
                     assignedTasks.filter { memberAddress.equals(it.key.second) }.values.forEach { it.completeExceptionally(IllegalStateException("Member $memberAddress lost")) }
                 //TODO: reassign work of missing
                 }
@@ -144,25 +150,43 @@ class ClusterExecutor(private val channel: JChannel) {
                     is ScheduleTaskMessage -> {
                         log.debug("Queuing task ${msgObject.task.id} from ${msg.src} for local execution")
 
+                        val task = msgObject.task
+                        executingTasks.add(task.id)
+
                         CompletableFuture
-                                .supplyAsync( Supplier { createClassLoader(msg.src, msgObject.task) }, localSingleThreadExecutor)
+                                .supplyAsync( Supplier { createClassLoader(msg.src, task) }, localSingleThreadExecutor)
                                 .thenApplyAsync( Function { classLoader : ClassLoader ->
                                     Thread.currentThread().contextClassLoader = classLoader
-                                    Util.objectFromByteBuffer<Callable<Any>>(msgObject.task.callableData, 0, msgObject.task.callableData.size, classLoader).call()
+                                    val startTime = System.currentTimeMillis()
+                                    val result = Util.objectFromByteBuffer<Callable<Any>>(task.callableData, 0, task.callableData.size, classLoader).call()
+                                    val executionTime = System.currentTimeMillis() - startTime
+                                    Pair(result, executionTime)
                                 }, localExecutor)
+                                .orTimeout(task.timeout, task.timeUnit)
                                 .handle { res, th ->
-                                    if (th != null) log.error(th.message, th)
-                                    val resultMsg = if (th!=null) TaskResultExceptionMessage(msgObject.task.id, th) else TaskResultMessage(msgObject.task.id, res)
-                                    log.debug { "Sending result ${msgObject.task.id} to ${msg.src}" }
+                                    executingTasks.remove(task.id)
+
+                                    val resultMsg = if (th!=null) {
+                                        log.error(th.message, th)
+                                        TaskResultExceptionMessage(msgObject.task.id, th)
+                                    } else {
+                                        val (result, executionTime) = res
+                                        log.trace { "Task ${task.id} execution time ${executionTime}" }
+                                        TaskResultMessage(task.id, TaskStats(executionTime), result)
+                                    }
+                                    log.debug { "Sending result ${task.id} to ${msg.src}" }
                                     channel.send(msg.src, resultMsg)
-                                    broadcastLoad()
+
+                                    broadcastWorkRequest()
                                 }
+
+                        broadcastWorkRequest()
                     }
-                    is ScheduledQueueSize -> {
-                        if (!currentMembersWorkload.containsKey(msg.src)) {
-                            log.debug("Introducing ${msg.src} to the worker pool: ${currentMembersWorkload.keys().toList()}")
+                    is TaskQueueStats -> {
+                        if (!currentMembersQueueStats.containsKey(msg.src)) {
+                            log.debug("Introducing ${msg.src} to the worker pool: ${currentMembersQueueStats.keys().toList()}")
                         }
-                        currentMembersWorkload[msg.src]=msgObject.size
+                        currentMembersQueueStats[msg.src]=msgObject
                     }
                     is TaskResultExceptionMessage -> {
                         log.debug("Received throwable for task ${msgObject.id} from ${msg.src}: ${msgObject.throwable.message}")
@@ -186,31 +210,42 @@ class ClusterExecutor(private val channel: JChannel) {
                         log.debug { "Sending class ${msgObject.canonicalName} to ${msg.src}" }
                         channel.send(msg.src, ClassDefinitionMessageData(msgObject.canonicalName, classData))
                     }
+                    is TaskRequestMessage -> {
+                        submittedTasks.poll()?.let {
+                            val (task, future) = it
+                            submitTaskToMember(task, msg.src).handle { t, u ->
+                                u?.let { future.completeExceptionally(it) } ?: future.complete(t)
+                            }
+                        }
+                    }
                 }
             }
         }
-        Executors.newSingleThreadExecutor().submit() {
-            while (true) {
-                Thread.sleep(5000)
-                broadcastLoad()
-                log.debug { "Cluster queue status: $currentMembersWorkload" }
-            }
+
+        Executors.newSingleThreadScheduledExecutor().scheduleWithFixedDelay( {
+            broadcastWorkRequest()
+            broadcastLoad()
+            log.debug { "Cluster load $currentMembersQueueStats" }
+        }, broadcastInterval, broadcastInterval, TimeUnit.MILLISECONDS)
+
+    }
+
+    private fun broadcastWorkRequest() {
+        if (executingTasks.size < maxTaskCount) {
+            log.debug { "Current load ${executingTasks.size} is less than allowed ${maxTaskCount}, broadcasting request for work" }
+            channel.send(null, TaskRequestMessage())
         }
     }
 
+    private fun getLocalQueueStats() = TaskQueueStats(executingTasks.size, submittedTasks.size, assignedTasks.size)
+
     private fun broadcastLoad() {
-        val queueSize = getLocalQueueSize()
-        channel.send(null, ScheduledQueueSize(queueSize))
+        channel.send(null, getLocalQueueStats())
     }
 
-    fun clusterLoad() : Double {
-        val load = currentMembersWorkload.reduceEntries(0, { it -> Pair(1L, it.value) }, { a, b -> Pair(a.first+b.first, a.second+b.second) })
-        return 1.0 * load.second / load.first
-    }
+    private fun getLocalLoad() = localExecutor.taskCount - localExecutor.completedTaskCount
 
-    private fun getLocalQueueSize() = localExecutor.taskCount - localExecutor.completedTaskCount
-
-    private fun submitTaskToMember(task: Task, member: Address = currentMembersWorkload.minBy { (_,v) -> v }!!.key): CompletableFuture<Any> {
+    private fun submitTaskToMember(task: Task, member: Address): CompletableFuture<Any> {
         val memberKey = Pair(task.id,member)
 
         val taskFuture = CompletableFuture<Any>()
@@ -218,23 +253,28 @@ class ClusterExecutor(private val channel: JChannel) {
         assignedTasks[memberKey] = taskFuture
         log.debug("Sending task ${task.id} to $member")
         channel.send(member, ScheduleTaskMessage(task))
-        //speculative increase of a remote work queue
-        currentMembersWorkload[member] = (currentMembersWorkload[member]?:0) + 1
-        // TODO: add timeout
 
         return taskFuture.whenComplete { t, u ->
             assignedTasks.remove(memberKey)
         }
     }
 
-    fun <T> submit(callable: Callable<T>, dependencies: Collection<String> = setOf()) : CompletableFuture<T> {
+    fun <T> submit(callable: Callable<T>, executionTimeout: Long, timeUnit: TimeUnit, dependencies: Collection<String> = setOf()) : CompletableFuture<T> {
         require(callable is Serializable) { "Command $callable has to be serializable" }
 
         val callableObjectData = Util.objectToByteBuffer(callable)
-        val task = Task(TaskId(), callableObjectData, dependencies)
+        val task = Task(TaskId(), callableObjectData, dependencies, executionTimeout, timeUnit)
+
+        val taskFuture = CompletableFuture<Any>()
+        submittedTasks.add(Pair(task, taskFuture))
+
+        taskFuture
+            .whenComplete { t, u ->
+                submittedTasks.removeIf { it.second == taskFuture }
+            }
 
         log.debug("Accepting task ${task.id}")
-        return submitTaskToMember(task) as CompletableFuture<T>
+        return taskFuture as CompletableFuture<T>
     }
 
 }
@@ -246,7 +286,9 @@ fun main() {
 
     val channel = JChannel(System.getProperty("jgroups.property","udp.xml"))
     channel.connect("classloader.proxy")
-    ClusterExecutor(channel)
+
+    val maxTaskCount = System.getProperty("maxTaskCount", (2 * Runtime.getRuntime().availableProcessors()).toString())
+    ClusterExecutor(channel, maxTaskCount.toInt())
 
     // hang in there
 }

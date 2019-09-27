@@ -1,6 +1,7 @@
 import org.jgroups.JChannel
 import java.io.Serializable
 import java.util.concurrent.Callable
+import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 
 
@@ -25,12 +26,14 @@ fun main() {
     val channel = JChannel()
     channel.connect("classloader.proxy")
 
-    val es = ClusterExecutor(channel)
+    val es = ClusterExecutor(channel, 0)
 
     Thread.sleep(4000) //let it join a cluster
 
-    arrayOf(IsPrime(1398341745571), SleepyCaller(3000), SleepyCaller(2000), SleepyCaller(4000), IsPrime(63018038201)).forEach {
-        es.submit(it as Callable<Any>)
+    arrayOf(IsPrime(1398341745571), SleepyCaller(3000), SleepyCaller(2000), SleepyCaller(4000), SleepyCaller(400000), IsPrime(63018038201)).forEach {
+        es.submit(it as Callable<Any>, 5, TimeUnit.SECONDS).handle { t, u ->
+            println("Got result for $it : $t $u")
+        }
     }
 
     //hang in there
