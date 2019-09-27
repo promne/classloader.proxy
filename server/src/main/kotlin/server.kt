@@ -36,8 +36,8 @@ class ClusterExecutor(private val channel: JChannel, private val maxTaskCount: I
     data class ScheduleTaskMessage(val task: Task): Serializable
     data class TaskResultMessage(val id: TaskId, val stats: TaskStats, val result: Any): Serializable
     data class TaskResultExceptionMessage(val id: TaskId, val throwable: Throwable): Serializable
-    data class TaskQueueStats(val executing: Int, val submitted: Int, val assigned: Int): Serializable {
-        override fun toString(): String = "[$executing, $submitted, $assigned]"
+    data class TaskQueueStats(val capacity: Int, val executing: Int, val submitted: Int, val assigned: Int): Serializable {
+        override fun toString(): String = "[$capacity, $executing, $submitted, $assigned]"
     }
 
     // locally executed tasks
@@ -237,13 +237,15 @@ class ClusterExecutor(private val channel: JChannel, private val maxTaskCount: I
         }
     }
 
-    private fun getLocalQueueStats() = TaskQueueStats(executingTasks.size, submittedTasks.size, assignedTasks.size)
+    private fun getLocalQueueStats() = TaskQueueStats(maxTaskCount, executingTasks.size, submittedTasks.size, assignedTasks.size)
 
     private fun broadcastLoad() {
         channel.send(null, getLocalQueueStats())
     }
 
     private fun getLocalLoad() = localExecutor.taskCount - localExecutor.completedTaskCount
+
+    public fun getClusterQueueStatus() = currentMembersQueueStats
 
     private fun submitTaskToMember(task: Task, member: Address): CompletableFuture<Any> {
         val memberKey = Pair(task.id,member)
