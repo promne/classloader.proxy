@@ -7,6 +7,7 @@ import java.io.Serializable
 import java.net.URLClassLoader
 import java.util.*
 import java.util.concurrent.*
+import java.util.function.BiFunction
 import java.util.function.Consumer
 import java.util.function.Function
 import java.util.function.Supplier
@@ -24,7 +25,7 @@ data class TaskResultReceivedFailEvent(val id: ClusterExecutor.TaskId, val membe
 
 typealias ClusterExecutorListener = (ClusterEvent) -> Unit
 
-class ClusterExecutor(private val channel: JChannel, private val maxTaskCount: Int, private val broadcastInterval : Long = 5000) {
+class ClusterExecutor(val channel: JChannel, private val maxTaskCount: Int, private val broadcastInterval : Long = 5000) {
 
     private val log = KotlinLogging.logger {}
 
@@ -273,7 +274,10 @@ class ClusterExecutor(private val channel: JChannel, private val maxTaskCount: I
 
     private fun getLocalLoad() = localExecutor.taskCount - localExecutor.completedTaskCount
 
-    public fun getClusterQueueStatus() = currentMembersQueueStats
+    public fun getClusterQueueStatus() = run {
+        currentMembersQueueStats[channel.address] = getLocalQueueStats()
+        currentMembersQueueStats
+    }
 
     private fun submitTaskToMember(task: Task, member: Address): CompletableFuture<Any> {
         val memberKey = Pair(task.id,member)
